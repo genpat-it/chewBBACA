@@ -30,6 +30,7 @@ try:
 	from HashProfiles import hash_profiles
 	from GetAlleles import get_alleles
 	from ComputeDistances import compute_distances
+	from ComputeMSA import compute_msa
 	from utils import (join_profiles,
 					   gene_prediction as gp,
 					   # profiles_sqlitedb as ps,
@@ -56,6 +57,7 @@ except ModuleNotFoundError:
 	from CHEWBBACA.HashProfiles import hash_profiles
 	from CHEWBBACA.GetAlleles import get_alleles
 	from CHEWBBACA.ComputeDistances import compute_distances
+	from ComputeMSA import compute_msa
 	from CHEWBBACA.utils import (join_profiles,
 								 gene_prediction as gp,
 								 # profiles_sqlitedb as ps,
@@ -1567,7 +1569,7 @@ def run_compute_msa():
 	parser.add_argument('--dna-msa', action='store_true',
 						required=False, dest='dna_msa',
 						help='Converts the protein MSA to DNA to create an additional '
-							 'output file with the DNA MSA..')
+							 'output file with the DNA MSA.')
 
 	parser.add_argument('--output-variable', type=str, required=False,
 						dest='output_variable',
@@ -1588,6 +1590,14 @@ def run_compute_msa():
 							 'used to run the process (chewie resets to a '
 							 'lower value if it is equal to or exceeds the total '
 							 'number of available CPU cores/threads).')
+
+	parser.add_argument('--keep-locus-msa', action='store_true',
+						required=False, dest='keep_locus_msa',
+						help='Keep the MSA files for each locus.')
+
+	parser.add_argument('--only-locus-msa', action='store_true',
+						required=False, dest='only_locus_msa',
+						help='Only keep the MSA files for each locus. Do not compute full sample MSA.')
 
 	args = parser.parse_args()
 	del args.ComputeMSA

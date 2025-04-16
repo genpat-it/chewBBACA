@@ -95,18 +95,26 @@ def main(input_file, schema_directory, output_directory, cpu_cores, distinct, tr
 		locus_column = masked_profiles[locus_id]
 		# Remove lines with 0
 		locus_column = locus_column[locus_column != '0']
-		# Store sample and allele ID
-		if not distinct:
-			allele_ids = list(zip(locus_column.index, locus_column))
-		# Only store allele ID
-		else:
-			allele_ids = pd.unique(locus_column).tolist()
-			# Sort values based
-			allele_ids = sorted(allele_ids, key=lambda x: int(x))
-			allele_ids = [(None, i) for i in allele_ids]
-		inputs.append((locus_id, allele_ids, loci_files[i], alleles_directory, get_locus_alleles))
-		# Get stats
+		# Store stats
 		loci_stats[locus_id].extend([fao.count_sequences(loci_files[i]), len(locus_column), len(pd.unique(locus_column))])
+		# Only try to fetch if the locus is in at least one sample
+		if len(locus_column) == 0:
+			print(f'No alleles for locus {locus_id} in the dataset. Skipping...')
+			continue
+		else:
+			# Store sample and allele ID
+			if not distinct:
+				allele_ids = list(zip(locus_column.index, locus_column))
+			# Only store allele ID
+			else:
+				allele_ids = pd.unique(locus_column).tolist()
+				# Sort values based
+				allele_ids = sorted(allele_ids, key=lambda x: int(x))
+				allele_ids = [(None, i) for i in allele_ids]
+			# Append input data for multiprocessing
+			inputs.append((locus_id, allele_ids, loci_files[i], alleles_directory, get_locus_alleles))
+
+	output_files = []
 
 	# Save loci statistics
 	loci_stats_file = fo.join_paths(output_directory, ['summary_stats.tsv'])
@@ -114,6 +122,7 @@ def main(input_file, schema_directory, output_directory, cpu_cores, distinct, tr
 	loci_stats_lines = [[k]+list(map(str, v)) for k, v in loci_stats.items()]
 	loci_stats_lines = [loci_stats_header] + ['\t'.join(l) for l in loci_stats_lines]
 	fo.write_lines(loci_stats_lines, loci_stats_file)
+	output_files.append(loci_stats_file)
 
 	# Get and save alleles to FASTA files
 	if not distinct:
@@ -121,6 +130,8 @@ def main(input_file, schema_directory, output_directory, cpu_cores, distinct, tr
 	else:
 		print('Creating FASTA files with the distinct alleles identified in the dataset...')
 	fasta_files = mo.map_async_parallelizer(inputs, mo.function_helper, cpu_cores)
+	fasta_files = [file for file in fasta_files if file is not None]
+	output_files.append(fasta_files)
 
 	if translate:
 		# Create folder to store FASTA files
@@ -129,5 +140,9 @@ def main(input_file, schema_directory, output_directory, cpu_cores, distinct, tr
 		print('Translating alleles...')
 		inputs = [[file, translated_alleles_directory, translation_table, fao.translate_fasta] for file in fasta_files]
 		protein_files = mo.map_async_parallelizer(inputs, mo.function_helper, cpu_cores)
+		# Only keep the translated files
+		protein_files = [f[1] for f in protein_files]
+		output_files.append(protein_files)
 
 	print(f'Output files available in {output_directory}')
+	return output_files
