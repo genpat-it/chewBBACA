@@ -158,16 +158,16 @@ def convert_msa_to_dna(input_file, dna_file, locus_id, gap_char, output_director
 	return dna_fasta
 
 # Test
-# input_file = '/home/rmamede/test_chewie/features/ComputeMSA/cdiff_test/profiles_ridom_967_loci_onlyPT.tsv'
-# schema_directory = '/home/rmamede/test_chewie/features/ComputeMSA/cdiff_test/Cdiff_cgMLST_schema'
-# output_directory = '/home/rmamede/test_chewie/features/ComputeMSA/cdiff_test/test_msa'
-# dna_msa = True
-# output_variable = False
-# gap_char = '-'
-# translation_table = 11
-# cpu_cores = 12
-# keep_locus_msa = False
-# only_locus_msa = False
+input_file = '/home/rmamede/test_chewie/features/ComputeMSA/cdiff_enterobase_data/20250422_Enterobase_cgMLST_filtered_dated_only_lc099_si099_flt_samples_matrix_100perc.tsv'
+schema_directory = '/home/rmamede/test_chewie/features/ComputeMSA/cdiff_enterobase_data/Cdiff_cgMLST_schema_Enterobase'
+output_directory = '/home/rmamede/test_chewie/features/ComputeMSA/cdiff_enterobase_data/test_msa'
+dna_msa = True
+output_variable = True
+gap_char = '-'
+translation_table = 11
+cpu_cores = 12
+keep_locus_msa = False
+only_locus_msa = False
 def main(input_file, schema_directory, output_directory, dna_msa, output_variable, gap_char, translation_table, cpu_cores, keep_locus_msa, only_locus_msa):
 	# Create output directory
 	fo.create_directory(output_directory)
@@ -242,9 +242,41 @@ def main(input_file, schema_directory, output_directory, dna_msa, output_variabl
 	fo.delete_directory(os.path.dirname(dna_files[0]))
 	fo.delete_directory(os.path.dirname(protein_files[0]))
 
+##############################
+# Create function to get variable positions
+# Need to concatenate SNP MSAs to get complete SNP MSA
+# Should exclude/ignore N's and gaps when determining variable positions for DNA MSA?
+# Need to save output files for protein, DNA and variable MSAs into separate folders
+
 	# Identify variable positions to get SNP MSA
 	if output_variable:
-		pass
+		# Determine variable positions for protein MSAs
+		for file in gapped_results:
+			locus_id = fo.file_basename(file).split('_gapped')[0]
+			# Read MSA
+			msa_records = fao.import_sequences(file)
+			msa_sequences = list(msa_records.values())
+			# Zip to pair chars in same positions
+			zipped = list(zip(*msa_sequences))
+			variable = []
+			for i, pos in enumerate(zipped):
+				# Get unique characters in position
+				distinct = set(pos)
+				# If there are more than 1 unique character, it is a variable position
+				if len(distinct) > 1:
+					variable.append([i, pos])
+			if len(variable) > 0:
+				variable_pos = list(zip(*[i[1] for i in variable]))
+				variable_pos = [''.join(i) for i in variable_pos]
+				variable_records = [[allele_id, variable_pos[i]] for i, allele_id in enumerate(msa_records.keys())]
+				variable_records = fao.fasta_lines(ct.FASTA_RECORD_TEMPLATE, variable_records)
+				output_file = fo.join_paths(output_directory, [locus_id + '_variable.fasta'])
+				fo.write_lines(variable_records, output_file)
+				# Save variable positions
+			else:
+				print(f'Locus {locus_id} has no variable positions. Will not write SNP MSA.')
+
+##############################
 
 	# User only wants the locus MSAs
 	# Do not compute full MSAs

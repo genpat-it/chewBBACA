@@ -58,7 +58,12 @@ def get_locus_alleles(locus_id, allele_ids, locus_file, output_directory):
 		else:
 			header = f'>{locus_id}_{a[0][1]}'
 		sequence = a[1]
-		record = '\n'.join([header, sequence])
+		###############################################################
+		# Alleles must be in the schema!
+		try:
+			record = '\n'.join([header, sequence])
+		except:
+			print(f'Error creating record for {locus_id} with allele {a[0][1]}')
 		records.append(record)
 
 	# Save to file
