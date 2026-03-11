@@ -68,11 +68,10 @@ BLOSUM62 = np.array(BLOSUM62_DATA, dtype=np.int32)
 GAP_OPEN = 11
 GAP_EXTEND = 1
 
-# CUDA kernel for batched Smith-Waterman using shared memory DP arrays.
-# Each block handles one pair with 1 thread. Parallelism is across pairs
-# (many blocks scheduled concurrently). Uses in-place column update with
-# a register for the diagonal value. 4 shared memory arrays: H, E (floats)
-# for DP scores, and Hs, Es (ints) for tracking alignment start position.
+# CUDA kernel for batched Smith-Waterman.
+# 1 thread per block, BLOSUM62 cached in shared memory for faster access.
+# 4 shared arrays: H, E (float) for DP + Hs, Es (int) for start tracking.
+
 _SW_KERNEL_CODE = r'''
 extern "C" __global__
 void smith_waterman_batch(
@@ -99,13 +98,20 @@ void smith_waterman_batch(
     int qoff = query_offsets[pair_idx];
     int toff = target_offsets[pair_idx];
 
-    // Shared memory: 4 arrays for in-place DP with start tracking
+    // Shared memory layout:
+    // H[stride] + E[stride] (floats) + Hs[stride] + Es[stride] (ints) + blosum[576] (ints)
     int stride = max_query_len + 1;
     extern __shared__ float shared_mem[];
-    float* H  = shared_mem;                // H values
-    float* E  = shared_mem + stride;       // E values (horizontal gap)
-    int*   Hs = (int*)(shared_mem + 2 * stride);  // query start for H
-    int*   Es = (int*)(shared_mem + 2 * stride) + stride;  // query start for E
+    float* H  = shared_mem;
+    float* E  = shared_mem + stride;
+    int*   Hs = (int*)(shared_mem + 2 * stride);
+    int*   Es = Hs + stride;
+    int*   blosum_s = Es + stride;
+
+    // Cache BLOSUM62 in shared memory (576 ints = 2.25 KB)
+    for (int k = 0; k < 576; k++) {
+        blosum_s[k] = blosum62[k];
+    }
 
     for (int i = 0; i <= qlen; i++) {
         H[i] = 0.0f;
@@ -120,7 +126,7 @@ void smith_waterman_batch(
 
     for (int j = 1; j <= tlen; j++) {
         int tj = targets[toff + j - 1];
-        const int* brow = blosum62 + tj;
+        const int* brow = blosum_s + tj;
         float Fval = 0.0f;
         int Fs = 0;
         float h_diag = 0.0f;
@@ -141,7 +147,6 @@ void smith_waterman_batch(
                 Es[i] = h_left_s;
             } else {
                 E[i] = e_ext;
-                // Es[i] stays (inherited from previous column)
             }
 
             // F: vertical gap (gap in query)
@@ -152,7 +157,6 @@ void smith_waterman_batch(
                 Fs = Hs[i-1];
             } else {
                 Fval = f_ext;
-                // Fs stays (inherited from row above)
             }
 
             // H: best of match, E, F, or 0
@@ -340,8 +344,8 @@ class GPUAligner:
                 bucket_max_qlen = int(q_lens_np[indices].max())
                 bucket_max_tlen = int(t_lengths[indices].max())
                 n_bucket = len(indices)
-                # 4 arrays: H, E (float) + Hs, Es (int), each stride = max_qlen+1
-                shared_mem_bytes = 4 * (bucket_max_qlen + 1) * 4
+                # 4 arrays: H, E (float) + Hs, Es (int) + BLOSUM62 (576 ints)
+                shared_mem_bytes = 4 * (bucket_max_qlen + 1) * 4 + 576 * 4
 
                 d_indices = cp.asarray(indices.astype(np.int32))
                 sub_results = cp.zeros(n_bucket * 5, dtype=cp.float32)
@@ -419,8 +423,8 @@ class GPUAligner:
                 bucket_max_qlen = int(q_lens_np[indices].max())
                 bucket_max_tlen = int(np.asarray(t_lengths)[indices].max())
                 n_bucket = len(indices)
-                # 4 arrays: H, E (float) + Hs, Es (int), each stride = max_qlen+1
-                shared_mem_bytes = 4 * (bucket_max_qlen + 1) * 4
+                # 4 arrays: H, E (float) + Hs, Es (int) + BLOSUM62 (576 ints)
+                shared_mem_bytes = 4 * (bucket_max_qlen + 1) * 4 + 576 * 4
 
                 d_indices = cp.asarray(indices.astype(np.int32))
                 sub_q_off = d_q_offsets[d_indices]
