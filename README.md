@@ -28,9 +28,9 @@ Since Smith-Waterman computes the mathematically optimal local alignment score (
 
 ## Benchmark
 
-| Dataset | Genomes | Loci | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | Profiles |
+| Dataset | Genomes | Loci | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | CRC32 Profiles |
 |---|---|---|---|---|---|---|
-| *L. monocytogenes* cgMLST (BeONE) | 1000 | 1748 | 168s | 108s | 1.56x | IDENTICAL |
+| *L. monocytogenes* cgMLST (BeONE) | 1000 | 1748 | 168.1s | 106.9s | 1.6x | IDENTICAL |
 
 ## Quick start
 
