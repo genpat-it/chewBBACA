@@ -784,101 +784,139 @@ def _gpu_blast_clusters(clusters, sequences_file, id_mapping,
 						output_directory, only_rep=False):
 	"""GPU implementation of blast_clusters.
 
-	Loads all sequences, builds alignment pairs for each cluster,
-	and runs them all on GPU in batched Smith-Waterman.
+	Loads all sequences, pre-encodes them once, builds alignment pairs
+	for each cluster, and runs them all on GPU in batched Smith-Waterman.
 	No multiprocessing needed - GPU handles parallelism.
 	"""
+	import time as _time
+	import numpy as np
 	from Bio import SeqIO
+	from CHEWBBACA.utils.gpu_sw import encode_sequence
+
+	_t0 = _time.time()
 
 	# Load all sequences from the FASTA file
 	all_sequences = {}
 	for record in SeqIO.parse(sequences_file, 'fasta'):
 		all_sequences[record.id] = str(record.seq)
 
+	# Pre-encode ALL sequences once (avoid redundant encoding per pair)
+	encoded_seqs = {}
+	for sid, seq_str in all_sequences.items():
+		encoded_seqs[sid] = encode_sequence(seq_str)
+
+	_t1 = _time.time()
+
 	# Build inverse mapping for ID conversion
 	inv_id_mapping = {v: k for k, v in id_mapping.items()} if id_mapping else {}
 
-	# Collect all alignment pairs across all clusters
-	all_query_seqs = []
-	all_target_seqs = []
-	all_query_ids = []
-	all_target_ids = []
+	# Collect all alignment pairs across all clusters as (qid, tid) index pairs
+	pair_qids = []
+	pair_tids = []
 	pair_cluster_map = []  # track which cluster each pair belongs to
 
 	for rep, members in clusters.items():
-		# Map representative to renamed ID
 		rep_renamed = id_mapping.get(rep, rep) if id_mapping else rep
-
-		# Member IDs (excluding representative)
 		member_ids = [id_mapping.get(m[0], m[0]) if id_mapping else m[0]
 					  for m in members]
 
 		if only_rep:
-			# Only align representative against cluster members (NOT self)
-			# This matches BLAST behavior: -seqidlist excludes representative
 			query_ids_cluster = [rep_renamed]
 			target_ids_cluster = member_ids
 		else:
-			# Align all against all within cluster (including representative)
 			query_ids_cluster = [rep_renamed] + member_ids
 			target_ids_cluster = [rep_renamed] + member_ids
 
 		for qid in query_ids_cluster:
-			if qid not in all_sequences:
+			if qid not in encoded_seqs:
 				continue
 			for tid in target_ids_cluster:
-				if tid not in all_sequences:
+				if tid not in encoded_seqs:
 					continue
-				all_query_seqs.append(all_sequences[qid])
-				all_target_seqs.append(all_sequences[tid])
-				all_query_ids.append(qid)
-				all_target_ids.append(tid)
+				pair_qids.append(qid)
+				pair_tids.append(tid)
 				pair_cluster_map.append(rep)
 
-	total_pairs = len(all_query_seqs)
-	print(f'\n  GPU: aligning {total_pairs} pairs across {len(clusters)} clusters...')
+	total_pairs = len(pair_qids)
+	_t2 = _time.time()
+	print(f'\n  GPU: {total_pairs} pairs across {len(clusters)} clusters '
+		  f'(load+encode={_t1-_t0:.1f}s, pairs={_t2-_t1:.1f}s)')
 
 	if total_pairs == 0:
 		return [[]]
 
+	# Build pre-flattened arrays for align_pairs_raw
+	# Map each unique sequence ID to an index for efficient lookup
+	unique_qids = list(set(pair_qids))
+	unique_tids = list(set(pair_tids))
+	all_unique = list(set(unique_qids + unique_tids))
+
+	# Build flattened sequence arrays and offset tables
+	seq_offset = {}  # sid -> offset in flat array
+	seq_length = {}  # sid -> length
+	flat_parts = []
+	current_offset = 0
+	for sid in all_unique:
+		enc = encoded_seqs[sid]
+		seq_offset[sid] = current_offset
+		seq_length[sid] = len(enc)
+		flat_parts.append(enc)
+		current_offset += len(enc)
+
+	flat_all = np.concatenate(flat_parts)
+
+	# Build per-pair offset/length arrays
+	q_offsets = np.array([seq_offset[qid] for qid in pair_qids], dtype=np.int32)
+	t_offsets = np.array([seq_offset[tid] for tid in pair_tids], dtype=np.int32)
+	q_lengths = np.array([seq_length[qid] for qid in pair_qids], dtype=np.int32)
+	t_lengths = np.array([seq_length[tid] for tid in pair_tids], dtype=np.int32)
+
+	_t3 = _time.time()
+
 	# Get GPU aligner
 	aligner = bw._get_gpu_aligner()
 
-	# Run GPU alignment in batches
-	batch_size = 200000
-	all_results = []
+	# Run GPU alignment using pre-encoded raw arrays
+	all_results = aligner.align_pairs_raw(
+		flat_all, flat_all,  # queries and targets share the same flat array
+		q_offsets, t_offsets, q_lengths, t_lengths,
+		pair_qids, pair_tids
+	)
 
-	for start in range(0, total_pairs, batch_size):
-		end = min(start + total_pairs, total_pairs)
-		batch_results = aligner.align_pairs(
-			all_query_seqs[start:end],
-			all_target_seqs[start:end],
-			all_query_ids[start:end],
-			all_target_ids[start:end]
-		)
-		all_results.extend(batch_results)
-		if total_pairs > batch_size:
-			print(f'\r  GPU: {min(end, total_pairs)}/{total_pairs} pairs aligned...', end='')
-
-	if total_pairs > batch_size:
-		print()
+	_t4 = _time.time()
+	print(f'  GPU: kernel+transfer={_t4-_t3:.1f}s, prep={_t3-_t2:.1f}s')
 
 	# Group results by cluster and write output files
-	cluster_results = {}
-	for i, r in enumerate(all_results):
-		cluster_rep = pair_cluster_map[i] if i < len(pair_cluster_map) else None
-		if cluster_rep:
-			cluster_results.setdefault(cluster_rep, []).append(r)
+	# Build a mapping from (qid, tid) -> result for fast lookup
+	result_by_pair = {}
+	for r in all_results:
+		result_by_pair.setdefault(r[0], []).append(r)
 
-	# Write one output file per cluster (same format as BLAST)
 	out_files = []
-	for rep, results in cluster_results.items():
+	for rep in clusters:
+		rep_renamed = id_mapping.get(rep, rep) if id_mapping else rep
+		member_ids = [id_mapping.get(m[0], m[0]) if id_mapping else m[0]
+					  for m in clusters[rep]]
+
+		if only_rep:
+			query_ids_cluster = [rep_renamed]
+		else:
+			query_ids_cluster = [rep_renamed] + member_ids
+
 		blast_output = os.path.join(output_directory,
 									'{0}_blastout.tsv'.format(rep))
+		has_results = False
 		with open(blast_output, 'w') as f:
-			for r in results:
-				f.write('\t'.join(str(x) for x in r) + '\n')
-		out_files.append(blast_output)
+			for qid in query_ids_cluster:
+				if qid in result_by_pair:
+					for r in result_by_pair[qid]:
+						f.write('\t'.join(str(x) for x in r) + '\n')
+						has_results = True
+		if has_results:
+			out_files.append(blast_output)
+
+	_t5 = _time.time()
+	print(f'  GPU: file write={_t5-_t4:.1f}s, total={_t5-_t0:.1f}s')
 
 	return [out_files]
 

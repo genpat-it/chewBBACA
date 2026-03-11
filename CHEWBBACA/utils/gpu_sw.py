@@ -268,11 +268,10 @@ class GPUAligner:
             self.blosum62_gpu = cp.asarray(BLOSUM62, dtype=cp.int32)
             self._kernel = cp.RawKernel(_SW_KERNEL_CODE, 'smith_waterman_batch')
             # Allow up to 99KB shared memory per block (L4 CC 8.9 supports this)
-            # Default is 48KB; this allows ~50% more concurrent blocks per SM
             try:
                 self._kernel.max_dynamic_shared_size_bytes = 99 * 1024
             except Exception:
-                pass  # fall back to default 48KB
+                pass
 
     def align_pairs(self, query_seqs, target_seqs, query_ids, target_ids):
         """Align pairs of sequences on GPU.
@@ -302,36 +301,54 @@ class GPUAligner:
         encoded_queries = [encode_sequence(q) for q in query_seqs]
         encoded_targets = [encode_sequence(t) for t in target_seqs]
 
-        # Compute offsets
-        q_offsets = np.zeros(num_pairs, dtype=np.int32)
-        t_offsets = np.zeros(num_pairs, dtype=np.int32)
+        # Compute offsets and lengths
         q_lengths = np.array([len(q) for q in encoded_queries], dtype=np.int32)
         t_lengths = np.array([len(t) for t in encoded_targets], dtype=np.int32)
 
-        q_total = 0
-        t_total = 0
-        for i in range(num_pairs):
-            q_offsets[i] = q_total
-            t_offsets[i] = t_total
-            q_total += len(encoded_queries[i])
-            t_total += len(encoded_targets[i])
+        q_offsets = np.zeros(num_pairs, dtype=np.int32)
+        t_offsets = np.zeros(num_pairs, dtype=np.int32)
+        np.cumsum(q_lengths[:-1], out=q_offsets[1:])
+        np.cumsum(t_lengths[:-1], out=t_offsets[1:])
 
         # Flatten sequences
-        all_queries = np.concatenate(encoded_queries) if num_pairs > 0 else np.array([], dtype=np.int32)
-        all_targets = np.concatenate(encoded_targets) if num_pairs > 0 else np.array([], dtype=np.int32)
+        all_queries = np.concatenate(encoded_queries)
+        all_targets = np.concatenate(encoded_targets)
+
+        return self.align_pairs_raw(all_queries, all_targets,
+                                     q_offsets, t_offsets, q_lengths, t_lengths,
+                                     query_ids, target_ids)
+
+    def align_pairs_raw(self, all_queries, all_targets,
+                         q_offsets, t_offsets, q_lengths, t_lengths,
+                         query_ids, target_ids):
+        """Align pairs using pre-encoded, pre-flattened sequence arrays.
+
+        Uses the warp kernel (32 threads/block) for sequences <= 2047aa,
+        falls back to the shared-memory kernel for longer sequences.
+        """
+        num_pairs = len(query_ids)
+        if num_pairs == 0:
+            return []
+
+        q_lens_np = np.asarray(q_lengths, dtype=np.int32)
+        t_lens_np = np.asarray(t_lengths, dtype=np.int32)
+        max_qlen = int(q_lens_np.max()) if num_pairs > 0 else 0
+        max_tlen = int(t_lens_np.max()) if num_pairs > 0 else 0
 
         with cp.cuda.Device(self.device):
             d_queries = cp.asarray(all_queries)
-            d_targets = cp.asarray(all_targets)
+            if all_targets is all_queries:
+                d_targets = d_queries
+            else:
+                d_targets = cp.asarray(all_targets)
             d_q_offsets = cp.asarray(q_offsets)
             d_t_offsets = cp.asarray(t_offsets)
-            d_q_lengths = cp.asarray(q_lengths)
-            d_t_lengths = cp.asarray(t_lengths)
+            d_q_lengths = cp.asarray(q_lens_np)
+            d_t_lengths = cp.asarray(t_lens_np)
             d_results = cp.zeros(num_pairs * 5, dtype=cp.float32)
 
             # Bucket pairs by query length for tight shared memory allocation
-            BUCKET_LIMITS = [128, 256, 512, 1024, 100000]
-            q_lens_np = q_lengths  # already numpy
+            BUCKET_LIMITS = [128, 256, 512, 1024, 2048, 100000]
 
             prev = 0
             for limit in BUCKET_LIMITS:
@@ -342,7 +359,6 @@ class GPUAligner:
                     continue
 
                 bucket_max_qlen = int(q_lens_np[indices].max())
-                bucket_max_tlen = int(t_lengths[indices].max())
                 n_bucket = len(indices)
                 # 4 arrays: H, E (float) + Hs, Es (int) + BLOSUM62 (576 ints)
                 shared_mem_bytes = 4 * (bucket_max_qlen + 1) * 4 + 576 * 4
@@ -358,7 +374,8 @@ class GPUAligner:
                      self.blosum62_gpu,
                      np.int32(self.gap_open), np.int32(self.gap_extend),
                      sub_results, np.int32(n_bucket),
-                     np.int32(bucket_max_qlen), np.int32(bucket_max_tlen)),
+                     np.int32(bucket_max_qlen),
+                     np.int32(int(t_lens_np[indices].max()))),
                     shared_mem=shared_mem_bytes
                 )
 
@@ -367,99 +384,25 @@ class GPUAligner:
 
             results_np = cp.asnumpy(d_results).reshape(num_pairs, 5)
 
-        # Format as BLAST output
-        blast_results = []
-        for i in range(num_pairs):
-            score = results_np[i, 0]
-            if score > 0:
-                qstart = int(results_np[i, 1])
-                qend = int(results_np[i, 2])
-                qlen = int(results_np[i, 3])
-                slen = int(results_np[i, 4])
-                blast_results.append(
-                    (query_ids[i], str(qstart), str(qend), str(qlen),
-                     target_ids[i], str(slen), str(score))
-                )
+        # Vectorized result filtering and formatting
+        scores = results_np[:, 0]
+        valid_indices = np.where(scores > 0)[0]
 
-        return blast_results
-
-    def align_pairs_raw(self, all_queries, all_targets,
-                         q_offsets, t_offsets, q_lengths, t_lengths,
-                         query_ids, target_ids):
-        """Align pairs using pre-encoded, pre-flattened sequence arrays.
-
-        This avoids redundant encoding when the same sequence appears
-        in multiple pairs (e.g., one query vs many targets).
-
-        Splits pairs into buckets by query length to maximize GPU occupancy.
-        Shared memory = 3*(max_qlen+1)*4 bytes per block, so grouping
-        similar-length queries allows more concurrent blocks per SM.
-        """
-        num_pairs = len(query_ids)
-        if num_pairs == 0:
+        if len(valid_indices) == 0:
             return []
 
-        with cp.cuda.Device(self.device):
-            d_queries = cp.asarray(all_queries)
-            d_targets = cp.asarray(all_targets)
-            d_q_offsets = cp.asarray(q_offsets)
-            d_t_offsets = cp.asarray(t_offsets)
-            d_q_lengths = cp.asarray(q_lengths)
-            d_t_lengths = cp.asarray(t_lengths)
-            d_results = cp.zeros(num_pairs * 5, dtype=cp.float32)
-
-            # Split pairs into buckets by query length for tight shared memory.
-            BUCKET_LIMITS = [128, 256, 512, 1024, 100000]
-            q_lens_np = np.asarray(q_lengths)
-
-            prev = 0
-            for limit in BUCKET_LIMITS:
-                mask = (q_lens_np >= prev) & (q_lens_np < limit)
-                indices = np.where(mask)[0]
-                if len(indices) == 0:
-                    prev = limit
-                    continue
-
-                bucket_max_qlen = int(q_lens_np[indices].max())
-                bucket_max_tlen = int(np.asarray(t_lengths)[indices].max())
-                n_bucket = len(indices)
-                # 4 arrays: H, E (float) + Hs, Es (int) + BLOSUM62 (576 ints)
-                shared_mem_bytes = 4 * (bucket_max_qlen + 1) * 4 + 576 * 4
-
-                d_indices = cp.asarray(indices.astype(np.int32))
-                sub_q_off = d_q_offsets[d_indices]
-                sub_t_off = d_t_offsets[d_indices]
-                sub_q_len = d_q_lengths[d_indices]
-                sub_t_len = d_t_lengths[d_indices]
-                sub_results = cp.zeros(n_bucket * 5, dtype=cp.float32)
-
-                self._kernel(
-                    (n_bucket,), (1,),
-                    (d_queries, d_targets, sub_q_off, sub_t_off,
-                     sub_q_len, sub_t_len, self.blosum62_gpu,
-                     np.int32(self.gap_open), np.int32(self.gap_extend),
-                     sub_results, np.int32(n_bucket),
-                     np.int32(bucket_max_qlen), np.int32(bucket_max_tlen)),
-                    shared_mem=shared_mem_bytes
-                )
-
-                d_results.reshape(num_pairs, 5)[d_indices] = sub_results.reshape(n_bucket, 5)
-                prev = limit
-
-            results_np = cp.asnumpy(d_results).reshape(num_pairs, 5)
-
         blast_results = []
-        for i in range(num_pairs):
-            score = results_np[i, 0]
-            if score > 0:
-                qstart = int(results_np[i, 1])
-                qend = int(results_np[i, 2])
-                qlen = int(results_np[i, 3])
-                slen = int(results_np[i, 4])
-                blast_results.append(
-                    (query_ids[i], str(qstart), str(qend), str(qlen),
-                     target_ids[i], str(slen), str(score))
-                )
+        valid_data = results_np[valid_indices]
+        for idx, i in enumerate(valid_indices):
+            blast_results.append(
+                (query_ids[i],
+                 str(int(valid_data[idx, 1])),
+                 str(int(valid_data[idx, 2])),
+                 str(int(valid_data[idx, 3])),
+                 target_ids[i],
+                 str(int(valid_data[idx, 4])),
+                 str(valid_data[idx, 0]))
+            )
 
         return blast_results
 
