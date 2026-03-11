@@ -45,12 +45,14 @@ Tested on the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-be
 
 | Dataset | Genomes | Loci | Schema | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | CRC32 Profiles |
 |---|---|---|---|---|---|---|---|
-| [*L. monocytogenes* (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | [cgMLST](https://chewbbaca.online/species/18/schemas/1) | 168.0s | 101.9s | 1.6x | IDENTICAL |
-| [*S. enterica* (BeONE)](https://zenodo.org/records/7802723) | 1540 | 8558 | [wgMLST](https://chewbbaca.online/species/14/schemas/1) | 811s | 664s | 1.2x | 99.997% |
+| [*L. monocytogenes* (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | [cgMLST](https://chewbbaca.online/species/18/schemas/1) | 168s | 102s | **1.6x** | IDENTICAL |
+| [*C. jejuni* (BeONE)](https://zenodo.org/records/7802717) | 610 | 2794 | [wgMLST](https://chewbbaca.online/species/6/schemas/1) | 236s | 124s | **1.9x** | 99.9998% |
+| [*E. coli* (BeONE)](https://zenodo.org/records/7802728) | 308 | 7601 | [wgMLST](https://chewbbaca.online/species/10/schemas/1) | 587s | 408s | **1.4x** | 99.996% |
+| [*S. enterica* (BeONE)](https://zenodo.org/records/7802723) | 1540 | 8558 | [wgMLST](https://chewbbaca.online/species/14/schemas/1) | 811s | 664s | **1.2x** | 99.997% |
 
 **Schemas**: [Chewie-NS](https://chewbbaca.online/) ([Mamede R et al., 2024](https://academic.oup.com/nar/article/52/D1/D909/7416388)) — the public Nomenclature Server for gene-by-gene typing schemas. The benchmark script automatically downloads schemas via the Chewie-NS API.
 
-**Note on wgMLST differences**: For wgMLST schemas (8000+ loci), a tiny fraction of borderline BSR cases may differ because Smith-Waterman computes the exact optimal score while BLAST uses heuristic approximations. These differences are negligible (< 0.003% of cells) and do not affect epidemiological interpretation.
+**Note on wgMLST differences**: For wgMLST schemas, a tiny fraction of borderline BSR cases may differ because Smith-Waterman computes the exact optimal score while BLAST uses heuristic approximations. These differences are negligible (< 0.004% of cells) and do not affect epidemiological interpretation.
 
 ## Quick start
 
