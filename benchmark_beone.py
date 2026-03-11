@@ -34,8 +34,8 @@ import glob
 sys.path.insert(0, os.path.dirname(__file__))
 
 # BeONE Listeria monocytogenes assemblies on Zenodo
-# https://zenodo.org/records/8207258
-ZENODO_LM_URL = "https://zenodo.org/records/8207258/files/Lm_beone_assemblies.zip"
+# https://zenodo.org/records/7802702
+ZENODO_LM_URL = "https://zenodo.org/api/records/7802702/files/BeONE_Lm_assemblies.zip/content"
 
 # Chewie-NS cgMLST schema for L. monocytogenes
 CHEWIE_NS_SCHEMA_ID = "6"  # L. monocytogenes cgMLST
@@ -43,88 +43,111 @@ CHEWIE_NS_URL = "https://chewbbaca.online/api/NS/api/species/9/schemas/1/zip"
 
 
 def download_file(url, dest_path):
-    """Download a file using wget or curl."""
-    if os.path.exists(dest_path):
-        print(f"  Already exists: {dest_path}")
+    """Download a file with progress bar. Tries wget, then curl."""
+    if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+        print(f"  Already downloaded: {os.path.basename(dest_path)}")
         return
-    print(f"  Downloading: {url}")
-    print(f"  Destination: {dest_path}")
+    print(f"  Downloading {os.path.basename(dest_path)} ...")
+    tmp_path = dest_path + ".part"
     try:
-        subprocess.run(
-            ["wget", "-q", "--show-progress", "-O", dest_path, url],
-            check=True
-        )
+        subprocess.run(["wget", "-O", tmp_path, url], check=True)
     except FileNotFoundError:
-        subprocess.run(
-            ["curl", "-L", "-o", dest_path, url],
-            check=True
-        )
+        subprocess.run(["curl", "-L", "--progress-bar", "-o", tmp_path, url],
+                        check=True)
+    os.rename(tmp_path, dest_path)
+    size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+    print(f"  Done ({size_mb:.0f} MB)")
+
+
+def _count_fastas(directory):
+    """Count FASTA files in a directory."""
+    return len([f for f in os.listdir(directory)
+                if f.endswith(('.fasta', '.fa', '.fna'))])
 
 
 def download_beone_data(data_dir):
-    """Download BeONE L. monocytogenes assemblies."""
+    """Download BeONE L. monocytogenes assemblies from Zenodo."""
     os.makedirs(data_dir, exist_ok=True)
     genomes_dir = os.path.join(data_dir, "genomes")
 
-    if os.path.exists(genomes_dir) and os.listdir(genomes_dir):
-        n = len([f for f in os.listdir(genomes_dir) if f.endswith('.fasta')])
-        print(f"  Genomes already downloaded: {n} FASTA files")
+    if os.path.exists(genomes_dir) and _count_fastas(genomes_dir) > 0:
+        print(f"  Genomes already present: {_count_fastas(genomes_dir)} FASTA files")
         return genomes_dir
 
-    zip_path = os.path.join(data_dir, "Lm_beone_assemblies.zip")
+    zip_path = os.path.join(data_dir, "BeONE_Lm_assemblies.zip")
     download_file(ZENODO_LM_URL, zip_path)
 
     print("  Extracting assemblies...")
-    os.makedirs(genomes_dir, exist_ok=True)
+    extract_tmp = os.path.join(data_dir, "_extract_tmp")
+    os.makedirs(extract_tmp, exist_ok=True)
     with zipfile.ZipFile(zip_path, 'r') as zf:
-        zf.extractall(genomes_dir)
+        zf.extractall(extract_tmp)
 
-    # Find FASTA files (may be in subdirectories)
-    fastas = glob.glob(os.path.join(genomes_dir, "**", "*.fasta"), recursive=True)
-    if not fastas:
-        fastas = glob.glob(os.path.join(genomes_dir, "**", "*.fa"), recursive=True)
-    if not fastas:
-        fastas = glob.glob(os.path.join(genomes_dir, "**", "*.fna"), recursive=True)
+    # Flatten: move all FASTA files to genomes_dir regardless of zip structure
+    os.makedirs(genomes_dir, exist_ok=True)
+    for ext in ('*.fasta', '*.fa', '*.fna'):
+        for f in glob.glob(os.path.join(extract_tmp, "**", ext), recursive=True):
+            shutil.move(f, os.path.join(genomes_dir, os.path.basename(f)))
+    shutil.rmtree(extract_tmp, ignore_errors=True)
 
-    # Move all FASTA files to genomes_dir root
-    for f in fastas:
-        dest = os.path.join(genomes_dir, os.path.basename(f))
-        if f != dest:
-            shutil.move(f, dest)
-
-    n = len([f for f in os.listdir(genomes_dir) if f.endswith(('.fasta', '.fa', '.fna'))])
-    print(f"  Extracted {n} genome assemblies")
+    n = _count_fastas(genomes_dir)
+    if n == 0:
+        print("  ERROR: No FASTA files found in the downloaded archive!")
+        print(f"  Check the contents of {zip_path}")
+        sys.exit(1)
+    print(f"  Ready: {n} genome assemblies")
     return genomes_dir
+
+
+def _find_schema_dir(base_dir):
+    """Find the actual schema directory (may be nested after DownloadSchema)."""
+    # Direct check
+    if any(f.endswith('.fasta') for f in os.listdir(base_dir)):
+        return base_dir
+    # Search one level deep
+    for d in os.listdir(base_dir):
+        candidate = os.path.join(base_dir, d)
+        if os.path.isdir(candidate):
+            if any(f.endswith('.fasta') for f in os.listdir(candidate)):
+                return candidate
+            # Two levels deep (DownloadSchema creates species/schema/)
+            for d2 in os.listdir(candidate):
+                candidate2 = os.path.join(candidate, d2)
+                if os.path.isdir(candidate2):
+                    if any(f.endswith('.fasta') for f in os.listdir(candidate2)):
+                        return candidate2
+    return base_dir
 
 
 def download_schema(data_dir):
     """Download L. monocytogenes cgMLST schema from Chewie-NS."""
-    schema_dir = os.path.join(data_dir, "schema")
+    schema_base = os.path.join(data_dir, "schema")
 
-    if os.path.exists(schema_dir):
+    if os.path.exists(schema_base):
+        schema_dir = _find_schema_dir(schema_base)
         n = len([f for f in os.listdir(schema_dir) if f.endswith('.fasta')])
         if n > 0:
-            print(f"  Schema already downloaded: {n} loci")
+            print(f"  Schema already present: {n} loci")
             return schema_dir
 
     print("  Downloading cgMLST schema from Chewie-NS...")
-    print("  You can also download manually via:")
-    print("    chewBBACA.py DownloadSchema -sp 9 -sc 1 -o beone_data/schema")
-
     try:
         subprocess.run([
             sys.executable, "-m", "CHEWBBACA.chewBBACA",
             "DownloadSchema",
             "-sp", "9",   # L. monocytogenes species ID
             "-sc", "1",   # Schema ID
-            "-o", schema_dir,
+            "-o", schema_base,
         ], check=True)
     except subprocess.CalledProcessError:
-        print("  ERROR: Failed to download schema from Chewie-NS.")
-        print("  Please download manually:")
-        print(f"    chewBBACA.py DownloadSchema -sp 9 -sc 1 -o {schema_dir}")
+        print("\n  ERROR: Failed to download schema.")
+        print("  Try manually:")
+        print(f"    chewBBACA.py DownloadSchema -sp 9 -sc 1 -o {schema_base}")
         sys.exit(1)
 
+    schema_dir = _find_schema_dir(schema_base)
+    n = len([f for f in os.listdir(schema_dir) if f.endswith('.fasta')])
+    print(f"  Ready: {n} loci")
     return schema_dir
 
 
@@ -243,24 +266,19 @@ def main():
 
     # Download data
     if not args.skip_download:
-        print("\n--- Downloading BeONE dataset ---")
+        print("\nStep 1/3: Downloading BeONE assemblies...")
         genomes_dir = download_beone_data(data_dir)
-        print("\n--- Downloading cgMLST schema ---")
+        print("\nStep 2/3: Downloading cgMLST schema...")
         schema_dir = download_schema(data_dir)
+        print("\nStep 3/3: Running benchmark...")
     else:
         genomes_dir = os.path.join(data_dir, "genomes")
-        schema_dir = os.path.join(data_dir, "schema")
-        if not os.path.exists(genomes_dir):
-            print(f"ERROR: {genomes_dir} not found. Run without --skip-download first.")
+        schema_base = os.path.join(data_dir, "schema")
+        if not os.path.exists(genomes_dir) or _count_fastas(genomes_dir) == 0:
+            print(f"ERROR: No genomes found in {genomes_dir}")
+            print("Run without --skip-download first.")
             sys.exit(1)
-
-    # Find schema subdirectory (Chewie-NS downloads into a subdirectory)
-    schema_subdirs = [d for d in os.listdir(schema_dir)
-                      if os.path.isdir(os.path.join(schema_dir, d))]
-    if schema_subdirs:
-        candidate = os.path.join(schema_dir, schema_subdirs[0])
-        if any(f.endswith('.fasta') for f in os.listdir(candidate)):
-            schema_dir = candidate
+        schema_dir = _find_schema_dir(schema_base)
 
     # Independent schema copies (to avoid lock conflicts)
     blast_schema = None
