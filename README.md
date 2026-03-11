@@ -24,7 +24,7 @@ GPU-accelerated fork of [chewBBACA](https://github.com/B-UMMI/chewBBACA) for fas
 
 The GPU implementation replaces BLAST's heuristic seed-and-extend with **exact Smith-Waterman alignment** (BLOSUM62, gap_open=11, gap_extend=1) executed on the GPU via CuPy CUDA kernels. A C-based 6-mer pre-filter reduces the number of candidate pairs before alignment.
 
-Since Smith-Waterman computes the mathematically optimal local alignment score (whereas BLAST uses heuristic approximations), the GPU version is at least as accurate as the original. On all tested datasets, the allelic profiles are **byte-identical**.
+Since Smith-Waterman computes the mathematically optimal local alignment score (whereas BLAST uses heuristic approximations), the GPU version is at least as accurate as the original. For cgMLST schemas, CRC32 hashed profiles are **byte-identical**. For wgMLST schemas (8000+ loci), a tiny fraction of borderline BSR cases may differ due to SW being exact where BLAST is approximate — these differences are negligible (< 0.003% of cells).
 
 The BLOSUM62 matrix and gap penalties (open=11, extend=1) are not configurable in chewBBACA — they match BLAST's hardcoded defaults, so the GPU kernel uses the same fixed parameters.
 
@@ -36,7 +36,8 @@ Tested on the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-be
 
 | Dataset | Genomes | Loci | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | CRC32 Profiles |
 |---|---|---|---|---|---|---|
-| [*L. monocytogenes* cgMLST (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | 168.1s | 106.9s | 1.6x | IDENTICAL |
+| [*L. monocytogenes* cgMLST (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | 168.0s | 101.9s | 1.6x | IDENTICAL |
+| [*S. enterica* wgMLST (BeONE)](https://zenodo.org/records/7802723) | 1540 | 8558 | 811s | 664s | 1.2x | 99.997% (395/13M cells) |
 
 ## Quick start
 
