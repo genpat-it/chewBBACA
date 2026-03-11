@@ -681,33 +681,19 @@ def transpose_matrix(input_file, output_directory):
 	-------
 	transposed_file : str
 		Path to the file with the transposed matrix.
-		This file is created by concatenating all
-		intermediate files.
 	"""
-	intermediate_files = []
+	# Single-pass: read entire file, transpose in memory, write once
 	with open(input_file, 'r') as infile:
-		# Get column identifiers
-		columns = [c.strip() for c in (infile.__next__()).split('\t')]
-		# Divide into smaller sets to avoid loading complete file
-		total_column_sets = math.ceil(len(columns)/100)
-		column_sets = im.divide_list_into_n_chunks(columns, total_column_sets)
-		# Use Pandas to read columns sets and save transpose
-		for i, c in enumerate(column_sets):
-			# dtype=str or Pandas converts values into floats
-			df = pd.read_csv(input_file, usecols=c, delimiter='\t', dtype=str)
-			output_file = join_paths(output_directory, ['chunk{0}.tsv'.format(i)])
-			# Transpose columns
-			df = df.T
-			# Do not save header that contains row indexes
-			df.to_csv(output_file, sep='\t', header=False)
-			intermediate_files.append(output_file)
+		rows = [line.rstrip('\n').split('\t') for line in infile]
 
-	# Concatenate all files with transposed lines
+	# Transpose: rows[i][j] -> transposed[j][i]
+	n_cols = len(rows[0]) if rows else 0
 	transposed_file = input_file.replace('.tsv', '_transpose.tsv')
-	concatenate_files(intermediate_files, transposed_file)
-
-	# Delete intermediate files
-	remove_files(intermediate_files)
+	with open(transposed_file, 'w') as outfile:
+		for j in range(n_cols):
+			outfile.write('\t'.join(row[j] if j < len(row) else ''
+									for row in rows))
+			outfile.write('\n')
 
 	return transposed_file
 

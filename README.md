@@ -12,12 +12,12 @@
 > **Warning**
 > This is an experimental branch under active development. It is **not recommended for production use**. While GPU results have been validated against the original BLAST pipeline on test datasets, edge cases may exist. Always verify results independently before using them in surveillance or clinical settings.
 
-GPU-accelerated fork of [chewBBACA](https://github.com/B-UMMI/chewBBACA) for faster allele calling with **deterministic results**.
+GPU-accelerated fork of [chewBBACA](https://github.com/B-UMMI/chewBBACA) for faster allele calling that produces **results identical to the original**.
 
 ## Goals
 
-- **Determinism**: produce allelic profiles **identical** to the original BLAST-based pipeline (verified via CRC32 hash comparison)
-- **Performance**: replace BLAST protein alignment with GPU-accelerated Smith-Waterman (CUDA), achieving significant speedup on commodity GPUs
+- **Same results**: produce allelic profiles **identical** to the original BLAST-based chewBBACA (verified via CRC32 hash comparison)
+- **Faster**: replace BLAST protein alignment with GPU-accelerated Smith-Waterman (CUDA), achieving significant speedup on commodity GPUs
 - **Drop-in replacement**: same CLI, same input/output formats — just add `--gpu`
 
 ## How it works

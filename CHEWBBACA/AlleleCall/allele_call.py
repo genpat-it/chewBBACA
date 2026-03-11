@@ -3164,11 +3164,16 @@ def main(input_file, loci_list, schema_directory, output_directory,
 	if config['CDS input'] is False:
 		print(f'Creating file with the coordinates of CDSs identified in inputs ({ct.CDS_COORDINATES_BASENAME})...')
 		_tws = _time.time()
-		files = []
-		for gid, file in results['cds_coordinates'].items():
+		# Parallel coordinate file writing
+		coord_items = list(results['cds_coordinates'].items())
+		def _write_coord(item):
+			gid, file = item
 			tsv_file = fo.join_paths(os.path.dirname(file), [f'{gid}_coordinates.tsv'])
 			cf.write_coordinates_file(file, tsv_file)
-			files.append(tsv_file)
+			return tsv_file
+		from multiprocessing.pool import ThreadPool as _CoordPool
+		with _CoordPool(min(config['CPU cores'], len(coord_items))) as _cpool:
+			files = _cpool.map(_write_coord, coord_items)
 		# Concatenate all TSV files with CDS coordinates
 		cds_coordinates = fo.join_paths(output_directory,
 										[ct.CDS_COORDINATES_BASENAME])
