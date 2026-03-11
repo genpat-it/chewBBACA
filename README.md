@@ -14,6 +14,15 @@
 
 GPU-accelerated fork of [chewBBACA](https://github.com/B-UMMI/chewBBACA) for faster allele calling that produces **results identical to the original**.
 
+## Motivation
+
+In modern genomic surveillance pipelines, cgMLST/wgMLST allele calling is often the computational bottleneck — especially when integrated with **incremental learning** ML models that need to re-profile incoming genomes continuously. Every new batch of sequences requires a full chewBBACA run, and as datasets grow (thousands of genomes, thousands of loci), the BLAST-based alignment step becomes the limiting factor for real-time or near-real-time analysis.
+
+A faster chewBBACA directly enables:
+- **Incremental ML pipelines**: models that retrain or update on newly profiled genomes can iterate faster when allele calling takes minutes instead of hours
+- **Large-scale surveillance**: national/international surveillance networks processing thousands of isolates daily
+- **Interactive analysis**: exploratory cgMLST analysis with rapid turnaround
+
 ## Goals
 
 - **Same results**: produce allelic profiles **identical** to the original BLAST-based chewBBACA (verified via CRC32 hash comparison)
@@ -24,7 +33,7 @@ GPU-accelerated fork of [chewBBACA](https://github.com/B-UMMI/chewBBACA) for fas
 
 The GPU implementation replaces BLAST's heuristic seed-and-extend with **exact Smith-Waterman alignment** (BLOSUM62, gap_open=11, gap_extend=1) executed on the GPU via CuPy CUDA kernels. A C-based 6-mer pre-filter reduces the number of candidate pairs before alignment.
 
-Since Smith-Waterman computes the mathematically optimal local alignment score (whereas BLAST uses heuristic approximations), the GPU version is at least as accurate as the original. For cgMLST schemas, CRC32 hashed profiles are **byte-identical**. For wgMLST schemas (8000+ loci), a tiny fraction of borderline BSR cases may differ due to SW being exact where BLAST is approximate — these differences are negligible (< 0.003% of cells).
+Since Smith-Waterman computes the mathematically optimal local alignment score (whereas BLAST uses heuristic approximations), the GPU version is at least as accurate as the original. For cgMLST schemas, CRC32 hashed profiles are **byte-identical**.
 
 The BLOSUM62 matrix and gap penalties (open=11, extend=1) are not configurable in chewBBACA — they match BLAST's hardcoded defaults, so the GPU kernel uses the same fixed parameters.
 
@@ -32,12 +41,16 @@ GPU acceleration applies to **mode 4** (default), which performs full protein al
 
 ## Benchmark
 
-Tested on the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-beone) project datasets:
+Tested on the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-beone) project datasets (genome assemblies from [Zenodo](https://zenodo.org/communities/beone)) with schemas downloaded from [Chewie-NS](https://chewbbaca.online/):
 
-| Dataset | Genomes | Loci | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | CRC32 Profiles |
-|---|---|---|---|---|---|---|
-| [*L. monocytogenes* cgMLST (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | 168.0s | 101.9s | 1.6x | IDENTICAL |
-| [*S. enterica* wgMLST (BeONE)](https://zenodo.org/records/7802723) | 1540 | 8558 | 811s | 664s | 1.2x | 99.997% (395/13M cells) |
+| Dataset | Genomes | Loci | Schema | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | CRC32 Profiles |
+|---|---|---|---|---|---|---|---|
+| [*L. monocytogenes* (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | [cgMLST](https://chewbbaca.online/species/18/schemas/1) | 168.0s | 101.9s | 1.6x | IDENTICAL |
+| [*S. enterica* (BeONE)](https://zenodo.org/records/7802723) | 1540 | 8558 | [wgMLST](https://chewbbaca.online/species/14/schemas/1) | 811s | 664s | 1.2x | 99.997% |
+
+**Schemas**: [Chewie-NS](https://chewbbaca.online/) ([Mamede R et al., 2024](https://academic.oup.com/nar/article/52/D1/D909/7416388)) — the public Nomenclature Server for gene-by-gene typing schemas. The benchmark script automatically downloads schemas via the Chewie-NS API.
+
+**Note on wgMLST differences**: For wgMLST schemas (8000+ loci), a tiny fraction of borderline BSR cases may differ because Smith-Waterman computes the exact optimal score while BLAST uses heuristic approximations. These differences are negligible (< 0.003% of cells) and do not affect epidemiological interpretation.
 
 ## Quick start
 
@@ -75,13 +88,17 @@ chewBBACA.py AlleleCall -i genomes/ -g schema/ -o output/
 
 ## Reproducibility
 
-A benchmark script is provided to verify determinism against the original BLAST pipeline using the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-beone) *Listeria monocytogenes* dataset:
+A fully automated benchmark script downloads genome assemblies from [Zenodo](https://zenodo.org/communities/beone) and schemas from [Chewie-NS](https://chewbbaca.online/), runs both BLAST and GPU pipelines, and compares CRC32 hashed profiles:
 
 ```bash
+# Run benchmark for a specific organism (downloads everything automatically)
+python benchmark_beone.py --organism lm --output-dir results/
+
+# Available organisms: lm (L. monocytogenes), se (S. enterica), ec (E. coli), cj (C. jejuni)
 python benchmark_beone.py --help
 ```
 
-See [`benchmark_beone.py`](benchmark_beone.py) for details on downloading the dataset and running the comparison.
+See [`benchmark_beone.py`](benchmark_beone.py) for details. No manual data preparation is needed — the script is fully plug-and-play.
 
 ## Architecture
 
