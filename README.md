@@ -26,6 +26,10 @@ The GPU implementation replaces BLAST's heuristic seed-and-extend with **exact S
 
 Since Smith-Waterman computes the mathematically optimal local alignment score (whereas BLAST uses heuristic approximations), the GPU version is at least as accurate as the original. On all tested datasets, the allelic profiles are **byte-identical**.
 
+The BLOSUM62 matrix and gap penalties (open=11, extend=1) are not configurable in chewBBACA — they match BLAST's hardcoded defaults, so the GPU kernel uses the same fixed parameters.
+
+GPU acceleration applies to **mode 4** (default), which performs full protein alignment via BLAST. Modes 1-2 only do exact matching (no alignment needed), and mode 3 uses a simplified clustering step. Determinism has been verified on mode 4.
+
 ## Benchmark
 
 Tested on the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-beone) project datasets:
