@@ -167,42 +167,51 @@ def main(profiles_table, schema_directory, output_directory, hash_type,
 		header = infile.readline()
 		loci_ids = header.split()[1:]
 
+	# Build per-locus file lists
 	loci_files = {}
 	for locus in loci_ids:
 		locus_file = fo.join_paths(schema_directory, [locus])
-		# Add .fasta extension if file headers did not include it
 		if locus_file.endswith('.fasta') is False:
 			locus_file += '.fasta'
 		loci_files[locus] = [locus_file]
 		if locus_file in updated_files and no_inferred is True:
 			loci_files[locus].append(updated_files[locus_file][0])
 
-	# Get input/sample identifiers
-	sample_ids = pd.read_csv(profiles_table, delimiter='\t',
-							 dtype=str, usecols=['FILE'])
+	# Pre-load allele→hash mappings for ALL loci in one pass
+	# (avoids re-reading FASTA files per chunk)
+	all_hashed = {}
+	for locus in loci_ids:
+		locus_alleles = {(rec.id).split('_')[-1].replace('*', ''): str(rec.seq)
+						 for rec in fao.sequence_generator(loci_files[locus][0])}
+		if len(loci_files[locus]) > 1:
+			novel_records = {(rec.id).split('_')[-1].replace('*', ''): str(rec.seq)
+							 for rec in fao.sequence_generator(loci_files[locus][1])}
+			locus_alleles = im.merge_dictionaries([locus_alleles, novel_records], True)
 
-	# Write file with header
-	header_basename = fo.file_basename(profiles_table).replace('.tsv', '_header.tsv')
-	header_file = fo.join_paths(output_directory, [header_basename])
-	fo.write_to_file(header, header_file, 'w', '')
+		hashed = {}
+		for seqid, seq in locus_alleles.items():
+			hashed_seq = hashing_function(seq.encode())
+			if isinstance(hashed_seq, int):
+				hashed_seq &= 0xffffffff
+			else:
+				hashed_seq = hashed_seq.hexdigest()
+			hashed[seqid] = hashed_seq
+		all_hashed[locus] = hashed
 
-	# Create multiprocessing inputs
-	multi_inputs = []
-	# Divide and process by row chunks
-	for i in range(0, len(sample_ids), nrows):
-		multi_inputs.append([profiles_table, loci_ids, loci_files,
-							 hashing_function, nrows, range(1, i+1),
-							 output_directory, hash_profiles])
+	# Read full profiles table once
+	profiles_df = pd.read_csv(profiles_table, delimiter='\t', dtype=str, index_col=0)
 
-	hashed_files = mo.map_async_parallelizer(multi_inputs, mo.function_helper,
-											 cpu_cores)
+	# Remove 'INF-' prefixes, missing data and '*' from identifiers
+	profiles_df = profiles_df.apply(im.replace_chars, args=('-'))
 
-	# Concatenate all files
+	# Apply hash mappings per locus column
+	for locus in loci_ids:
+		hmap = all_hashed[locus]
+		profiles_df[locus] = profiles_df[locus].map(lambda x: hmap.get(x, x))
+
+	# Write output
 	output_basename = fo.file_basename(profiles_table).replace('.tsv', '_hashed.tsv')
 	output_file = fo.join_paths(output_directory, [output_basename])
-	fo.concatenate_files([header_file]+hashed_files, output_file)
-
-	# Delete intermediate dataframes
-	fo.remove_files([header_file]+hashed_files)
+	profiles_df.to_csv(output_file, sep='\t', index=True)
 
 	return output_file

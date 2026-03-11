@@ -320,7 +320,19 @@ def update_classification(genome_id, locus_results, match_info):
 	return locus_results
 
 
-def count_global_classifications(classification_files, classification_labels):
+def _count_single_locus(locus_results, classification_labels):
+	"""Count classifications for a single pre-loaded locus."""
+	total_cds = sum([len([r for r in c if isinstance(r, tuple)])
+					 for g, c in locus_results.items()])
+	locus_classifications = [c[0] for g, c in locus_results.items()]
+	locus_counts = Counter(locus_classifications)
+	locus_counts.update(Counter({k: 0 for k in classification_labels[:-1]
+								 if k not in locus_counts}))
+	return [locus_counts, total_cds]
+
+
+def count_global_classifications(classification_files, classification_labels,
+								 preloaded_classifications=None):
 	"""Determine counts for each classification type.
 
 	Parameters
@@ -344,8 +356,14 @@ def count_global_classifications(classification_files, classification_labels):
 	"""
 	total_cds = 0
 	classification_counts = Counter()
-	for file in classification_files:
-		locus_results = fo.pickle_loader(file)
+
+	# Use pre-loaded data if available
+	if preloaded_classifications is not None:
+		results_iter = [lr for _, lr in preloaded_classifications]
+	else:
+		results_iter = [fo.pickle_loader(file) for file in classification_files]
+
+	for locus_results in results_iter:
 		total_cds += sum([len([r for r in c if isinstance(r, tuple)])
 						  for g, c in locus_results.items()])
 		locus_classifications = [c[0] for g, c in locus_results.items()]
@@ -663,7 +681,8 @@ def allele_size_classification(sequence_length, locus_mode, size_threshold):
 
 
 def write_loci_summary(classification_files, output_directory, total_inputs,
-					   classification_labels, loci_finder):
+					   classification_labels, loci_finder,
+					   preloaded_classifications=None):
 	"""Write a TSV file with classification counts per locus.
 
 	Parameters
@@ -682,6 +701,8 @@ def write_loci_summary(classification_files, output_directory, total_inputs,
 	loci_finder : re.Pattern
 		Regular expression object to search for loci identifiers
 		in paths and filenames.
+	preloaded_classifications : list, optional
+		Pre-loaded list of (locus_id, locus_results) tuples.
 
 
 	Returns
@@ -690,12 +711,18 @@ def write_loci_summary(classification_files, output_directory, total_inputs,
 		Path to the output file.
 	"""
 	loci_stats = [ct.LOCI_STATS_HEADER]
-	for k, v in classification_files.items():
-		locus_id = loci_finder.search(k).group()
-		locus_results = fo.pickle_loader(v)
 
+	# Use pre-loaded data or load from disk
+	if preloaded_classifications is not None:
+		loaded = preloaded_classifications
+	else:
+		loaded = []
+		for k, v in classification_files.items():
+			loaded.append((loci_finder.search(k).group(), fo.pickle_loader(v)))
+
+	for locus_id, locus_results in loaded:
 		# Count locus classifications
-		current_counts = count_global_classifications([v], classification_labels)
+		current_counts = _count_single_locus(locus_results, classification_labels)
 		counts_list = [locus_id]
 		for c in classification_labels[:-1]:
 			counts_list.append(str(current_counts[0][c]))
@@ -761,7 +788,8 @@ def write_logfile(start_time, end_time, total_inputs,
 
 
 def write_results_alleles(classification_files, input_identifiers,
-						  output_directory, missing_class, loci_finder):
+						  output_directory, missing_class, loci_finder,
+						  preloaded_classifications=None):
 	"""Write a TSV file with the allelic profiles for the input samples.
 
 	Parameters
@@ -777,6 +805,8 @@ def write_results_alleles(classification_files, input_identifiers,
 	loci_finder : re.Pattern
 		Regular expression object to search for loci identifiers
 		in paths and filenames.
+	preloaded_classifications : list, optional
+		Pre-loaded list of (locus_id, locus_results) tuples.
 
 	Returns
 	-------
@@ -790,10 +820,16 @@ def write_results_alleles(classification_files, input_identifiers,
 									  ['inter_results_alleles.tsv'])
 	# Add first column with input identifiers
 	columns = [['FILE'] + input_identifiers]
-	for i, file in enumerate(classification_files):
-		# Get locus identifier to add as column header
-		locus_id = loci_finder.search(file).group()
-		locus_results = fo.pickle_loader(file)
+
+	# Use pre-loaded data if available
+	if preloaded_classifications is not None:
+		loaded = preloaded_classifications
+	else:
+		loaded = []
+		for file in classification_files:
+			loaded.append((loci_finder.search(file).group(), fo.pickle_loader(file)))
+
+	for i, (locus_id, locus_results) in enumerate(loaded):
 		locus_column = [locus_id]
 		for ri in range(1, len(input_identifiers)+1):
 			# Determine if locus was found in each input
@@ -811,7 +847,7 @@ def write_results_alleles(classification_files, input_identifiers,
 
 		columns.append(locus_column)
 
-		if (len(columns)*len(input_identifiers)) >= values_limit or (i+1) == len(classification_files):
+		if (len(columns)*len(input_identifiers)) >= values_limit or (i+1) == len(loaded):
 			inter_lines = [im.join_list(c, '\t') for c in columns]
 			fo.write_lines(inter_lines, intermediate_file, write_mode='a')
 			columns = []
@@ -856,7 +892,8 @@ def write_results_masked(input_file, output_directory):
 
 def write_results_statistics(classification_files, input_identifiers,
 							 cds_counts, output_directory, classification_labels,
-							 repeated_counts, invalid_data):
+							 repeated_counts, invalid_data,
+							 preloaded_classifications=None):
 	"""Write a TSV file with classification counts per input.
 
 	Parameters
@@ -882,6 +919,8 @@ def write_results_statistics(classification_files, input_identifiers,
 	invalid_data : dict
 		Dictionary with input identifiers as keys and the total
 		number of invalid CDSs as values.
+	preloaded_classifications : list, optional
+		Pre-loaded list of (locus_id, locus_results) tuples.
 
 	Returns
 	-------
@@ -892,8 +931,14 @@ def write_results_statistics(classification_files, input_identifiers,
 	# Initialize classification counts per input
 	class_counts = {i: {c: 0 for c in classification_labels}
 					for i in input_identifiers}
-	for file in classification_files.values():
-		locus_results = fo.pickle_loader(file)
+
+	# Use pre-loaded data or load from disk
+	if preloaded_classifications is not None:
+		results_iter = [lr for _, lr in preloaded_classifications]
+	else:
+		results_iter = [fo.pickle_loader(file) for file in classification_files.values()]
+
+	for locus_results in results_iter:
 
 		for i in class_counts:
 			if i in locus_results:
@@ -929,7 +974,8 @@ def write_results_statistics(classification_files, input_identifiers,
 
 def write_results_contigs(classification_files, input_identifiers,
 						  output_directory, cds_coordinates_files,
-						  classification_labels, loci_finder):
+						  classification_labels, loci_finder,
+						  preloaded_classifications=None):
 	"""Write a TSV file with the CDS coordinates for each input.
 
 	Writes a TSV file with coding sequence coordinates (contig
@@ -980,21 +1026,27 @@ def write_results_contigs(classification_files, input_identifiers,
 	# Get hash if coordinates are available, seqid otherwise
 	id_index = 2 if cds_coordinates_files is not None else 1
 
-	for i, file in enumerate(classification_files):
-		locus_id = loci_finder.search(file).group()
-		locus_results = fo.pickle_loader(file)
+	# Use pre-loaded data if available, otherwise load from disk with threads
+	if preloaded_classifications is not None:
+		loaded = preloaded_classifications
+	else:
+		from multiprocessing.pool import ThreadPool as _CIPool
+		def _load_class_file(file):
+			return (loci_finder.search(file).group(), fo.pickle_loader(file))
+		with _CIPool(min(8, len(classification_files))) as _cipool:
+			loaded = _cipool.map(_load_class_file, classification_files)
+
+	for i, (locus_id, locus_results) in enumerate(loaded):
 		column = [locus_id]
 		for gid in input_identifiers:
-			# Get sequence hash for exact and inferred
 			if gid in locus_results and locus_results[gid][0] not in invalid_classes:
 				column.append(locus_results[gid][1][id_index])
-			# Get classification for other cases or LNF/PLNF for no classification
 			else:
 				column.append(locus_results.get(gid, [classification_labels[-1]])[0])
 
 		columns.append(column)
 
-		if (len(columns)*len(input_identifiers)) >= values_limit or (i+1) == len(classification_files):
+		if (len(columns)*len(input_identifiers)) >= values_limit or (i+1) == len(loaded):
 			inter_lines = [im.join_list(c, '\t') for c in columns]
 			fo.write_lines(inter_lines, intermediate_file, write_mode='a')
 			columns = []
@@ -2968,9 +3020,11 @@ def main(input_file, loci_list, schema_directory, output_directory,
 	# Sort to get output order similar to chewBBACA v2
 	results['classification_files'] = dict(sorted(results['classification_files'].items()))
 
+	classification_file_list = list(results['classification_files'].values())
+
 	_tw0 = _time.time()
 	print(f'Creating file with genome coordinates profiles ({ct.RESULTS_COORDINATES_BASENAME})...')
-	results_contigs = write_results_contigs(list(results['classification_files'].values()),
+	results_contigs = write_results_contigs(classification_file_list,
 											results['int_to_unique'],
 											output_directory,
 											results['cds_coordinates'],
@@ -3082,14 +3136,27 @@ def main(input_file, loci_list, schema_directory, output_directory,
 
 	_tw3 = _time.time()
 	print(f'    [wrap] novel alleles+schema update: {_tw3-_tw2:.1f}s')
+
+	# Pre-load all classification pickles once (after assign_allele_ids updated them)
+	# Shared across write_results_alleles, write_results_statistics, write_loci_summary, count_global_classifications
+	print('Pre-loading updated classification data...')
+	_tpre = _time.time()
+	from multiprocessing.pool import ThreadPool as _PreloadPool
+	def _preload_pickle(file):
+		return (loci_finder.search(file).group(), fo.pickle_loader(file))
+	with _PreloadPool(min(8, len(classification_file_list))) as _ppool:
+		preloaded_classifications = _ppool.map(_preload_pickle, classification_file_list)
+	print(f'    [wrap] preload pickles: {_time.time()-_tpre:.1f}s')
+
 	# Create file with allelic profiles
 	print(f'Creating file with the allelic profiles ({ct.RESULTS_ALLELES_BASENAME})...')
 	_tws = _time.time()
-	profiles_table = write_results_alleles(list(results['classification_files'].values()),
+	profiles_table = write_results_alleles(classification_file_list,
 										   list(results['int_to_unique'].values()),
 										   output_directory,
 										   classification_labels[-1],
-										   loci_finder)
+										   loci_finder,
+										   preloaded_classifications)
 	print(f'      alleles: {_time.time()-_tws:.1f}s')
 
 	# Create file with masked profiles
@@ -3106,7 +3173,8 @@ def main(input_file, loci_list, schema_directory, output_directory,
 												output_directory,
 												classification_labels,
 												repeated_counts,
-												results['invalid_alleles'])
+												results['invalid_alleles'],
+												preloaded_classifications)
 	print(f'      statistics: {_time.time()-_tws:.1f}s')
 
 	# Create file with class counts per locus called
@@ -3116,7 +3184,8 @@ def main(input_file, loci_list, schema_directory, output_directory,
 										 output_directory,
 										 len(input_files),
 										 classification_labels,
-										 loci_finder)
+										 loci_finder,
+										 preloaded_classifications)
 	print(f'      loci_summary: {_time.time()-_tws:.1f}s')
 
 	# Create FASTA file with unclassified CDSs
@@ -3192,7 +3261,8 @@ def main(input_file, loci_list, schema_directory, output_directory,
 	# Count total for each classification type
 	print('Counting number of classified CDSs...')
 	global_counts, total_cds = count_global_classifications(results['classification_files'].values(),
-													 classification_labels)
+													 classification_labels,
+													 preloaded_classifications)
 
 	# Subtract number of times a CDSs is repeated
 	print(f'Classified a total of {total_cds-sum(repeated_counts.values())} CDSs.')
