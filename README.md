@@ -9,6 +9,9 @@
 
 # chewBBACA-GPU
 
+> **Warning**
+> This is an experimental branch under active development. It is **not recommended for production use**. While GPU results have been validated against the original BLAST pipeline on test datasets, edge cases may exist. Always verify results independently before using them in surveillance or clinical settings.
+
 GPU-accelerated fork of [chewBBACA](https://github.com/B-UMMI/chewBBACA) for faster allele calling with **deterministic results**.
 
 ## Goals
