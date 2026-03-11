@@ -28,9 +28,11 @@ Since Smith-Waterman computes the mathematically optimal local alignment score (
 
 ## Benchmark
 
+Tested on the [BeONE](https://onehealthejp.eu/projects/foodborne-zoonoses/jrp-beone) project datasets:
+
 | Dataset | Genomes | Loci | BLAST (8 threads) | GPU (NVIDIA L4) | Speedup | CRC32 Profiles |
 |---|---|---|---|---|---|---|
-| *L. monocytogenes* cgMLST (BeONE) | 1000 | 1748 | 168.1s | 106.9s | 1.6x | IDENTICAL |
+| [*L. monocytogenes* cgMLST (BeONE)](https://zenodo.org/records/7802702) | 1000 | 1748 | 168.1s | 106.9s | 1.6x | IDENTICAL |
 
 ## Quick start
 
