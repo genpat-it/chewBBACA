@@ -22,6 +22,28 @@ import time
 import gzip
 import shutil
 import pickle
+
+# In-memory pickle cache to avoid redundant disk I/O
+_PICKLE_CACHE = {}
+
+
+def clear_pickle_cache():
+	"""Clear the in-memory pickle cache."""
+	_PICKLE_CACHE.clear()
+
+
+def preload_pickle_files(file_paths):
+	"""Pre-load a list of pickle files into the in-memory cache.
+
+	Use this to batch-load files that will be read multiple times,
+	avoiding redundant disk I/O on subsequent pickle_loader calls.
+	"""
+	for fp in file_paths:
+		abs_path = os.path.abspath(fp)
+		if abs_path not in _PICKLE_CACHE:
+			with open(fp, 'rb') as pinfile:
+				_PICKLE_CACHE[abs_path] = pickle.load(pinfile)
+
 import zipfile
 import pathlib
 import hashlib
@@ -303,6 +325,7 @@ def pickle_dumper(content, output_file):
 	"""
 	with open(output_file, 'wb') as poutfile:
 		pickle.dump(content, poutfile)
+	#_PICKLE_CACHE[os.path.abspath(output_file)] = content
 
 
 def pickle_loader(input_file):
@@ -319,6 +342,10 @@ def pickle_loader(input_file):
 		Variable that refers to the de-serialized
 		object.
 	"""
+	abs_path = os.path.abspath(input_file)
+	cached = _PICKLE_CACHE.get(abs_path)
+	if cached is not None:
+		return cached
 	with open(input_file, 'rb') as pinfile:
 		content = pickle.load(pinfile)
 

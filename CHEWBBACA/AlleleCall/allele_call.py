@@ -979,6 +979,7 @@ def write_results_contigs(classification_files, input_identifiers,
 	values_limit = ct.RESULTS_MAXVALS
 	# Get hash if coordinates are available, seqid otherwise
 	id_index = 2 if cds_coordinates_files is not None else 1
+
 	for i, file in enumerate(classification_files):
 		locus_id = loci_finder.search(file).group()
 		locus_results = fo.pickle_loader(file)
@@ -1989,6 +1990,7 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 		self-alignment BLASTp raw score, dictionary with information about
 		new representatives for each locus).
 	"""
+	import time as _time
 	# Get dictionary template to store variables to return
 	template_dict = ct.ALLELECALL_DICT
 
@@ -2006,12 +2008,16 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 		print('='*(len(ct.CDS_PREDICTION)+2))
 
 		# Gene prediction step
+		_t_cds_start = _time.time()
 		print(f'Predicting CDSs for {len(fasta_files)} inputs...')
+		# Pyrodigal releases the GIL during C computation, so it benefits
+		# from more threads than CPU cores (up to 16 for optimal throughput)
+		pyrodigal_cores = max(config['CPU cores'], min(16, len(fasta_files)))
 		pyrodigal_results = cf.predict_genes(input_file_ids,
 											 config['Prodigal training file'],
 											 config['Translation table'],
 											 config['Prodigal mode'],
-											 config['CPU cores'],
+											 pyrodigal_cores,
 											 pyrodigal_path)
 
 		# Dictionary with info about inputs for which gene prediction failed
@@ -2029,7 +2035,9 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 		if len(cds_fastas) == 0:
 			sys.exit(f'{ct.CANNOT_PREDICT}')
 
+		_t_cds_elapsed = _time.time() - _t_cds_start
 		print(f'\nExtracted a total of {total_extracted} CDSs from {len(fasta_files)-len(failed)} inputs.')
+		print(f'  [TIMING] CDS prediction: {_t_cds_elapsed:.1f}s')
 	# Inputs are Fasta files with the predicted CDSs
 	else:
 		# Rename the CDSs in each file based on the input unique identifiers
@@ -2101,6 +2109,7 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 	# keep hash of unique sequences and a list with the integer
 	# identifiers of genomes that have those sequences
 	# lists of integers are encoded with polyline algorithm
+	_t_phase_start = _time.time()
 	print(f'\n {ct.CDS_DEDUPLICATION} ')
 	print('='*(len(ct.CDS_DEDUPLICATION)+2))
 	# Create directory to store files from DNA deduplication
@@ -2296,6 +2305,9 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 		return template_dict
 
 	# Translate schema representatives
+	_t_preprocess_elapsed = _time.time() - _t_phase_start
+	print(f'  [TIMING] Dedup+ExactMatch+Translation: {_t_preprocess_elapsed:.1f}s')
+	_t_clustering_start = _time.time()
 	print(f'\n {ct.PROTEIN_CLUSTERING} ')
 	print('='*(len(ct.PROTEIN_CLUSTERING)+2))
 	print('Translating schema representative alleles...')
@@ -2506,6 +2518,9 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 
 		return template_dict
 
+	_t_clustering_elapsed = _time.time() - _t_clustering_start
+	print(f'  [TIMING] Protein clustering+BLAST: {_t_clustering_elapsed:.1f}s')
+	_t_repdet_start = _time.time()
 	print(f'\n {ct.REPRESENTATIVE_DETERMINATION} ')
 	print('='*(len(ct.REPRESENTATIVE_DETERMINATION)+2))
 	print('Aligning representative alleles against unclassified proteins...')
@@ -2575,6 +2590,7 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 
 		# BLAST representatives against unclassified sequences
 		# Iterative process until no more sequences are classified
+		_t_iter_start = _time.time()
 		print('\r', '{:^11} {:^9} {:^14}'.format(iteration, len(repprot_fastas), '...'), end='')
 
 		# Concatenate to create groups of 100 loci
@@ -2607,11 +2623,41 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 								 None, bw.run_blast])
 
 		# BLAST representatives against unclassified sequences
-		blastp_results = mo.map_async_parallelizer(blast_inputs,
-												   mo.function_helper,
-												   config['CPU cores'],
-												   show_progress=False)
+		# GPU mode: batch all into a single GPU call for efficiency
+		_t_blast_start = _time.time()
+		if bw.is_gpu_enabled():
+			# Concatenate all query files into one
+			all_reps_file = fo.join_paths(iteration_blast_dir, ['all_reps_concat.fasta'])
+			fo.concatenate_files([inp[2] for inp in blast_inputs], all_reps_file)
+			combined_outfile = fo.join_paths(iteration_blast_dir, ['all_reps_blastout.tsv'])
+			# Single GPU BLAST call with all reps
+			bw.run_blast(blastp_path, blast_db, all_reps_file,
+			             combined_outfile, 1, 1,
+			             remaining_seqids_file, 'blastp', 500, None)
+			# Split combined output into per-file outputs
+			combined_results = fo.read_tabular(combined_outfile)
+			# Map each result to the correct output file based on which query file it came from
+			file_queries = {}
+			from Bio import SeqIO
+			for i, inp in enumerate(blast_inputs):
+				query_file = inp[2]
+				for record in SeqIO.parse(query_file, 'fasta'):
+					file_queries[record.id] = i
+			per_file = [[] for _ in blast_inputs]
+			for line in combined_results:
+				qid = line[0]
+				if qid in file_queries:
+					per_file[file_queries[qid]].append('\t'.join(line))
+			for i, lines in enumerate(per_file):
+				fo.write_lines(lines, output_files[i])
+			blastp_results = [[b'', b'']] * len(blast_inputs)
+		else:
+			blastp_results = mo.map_async_parallelizer(blast_inputs,
+													   mo.function_helper,
+													   config['CPU cores'],
+													   show_progress=False)
 
+		_t_blast_elapsed = _time.time() - _t_blast_start
 		# Get BLASTp results per locus
 		blast_merged_dir = fo.join_paths(iteration_blast_dir, ['concatenated'])
 		fo.create_directory(blast_merged_dir)
@@ -2678,10 +2724,12 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 										  config['CDS input'],
 										  classify_inexact_matches])
 
+		_t_classify_start = _time.time()
 		class_results = mo.map_async_parallelizer(classification_inputs,
 												  mo.function_helper,
 												  config['CPU cores'],
 												  show_progress=False)
+		_t_classify_elapsed = _time.time() - _t_classify_start
 
 		# Need to identify representative candidates that match several
 		# loci and remove them from the analysis
@@ -2740,10 +2788,17 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 					representatives[k] = [(v[0][1], v[0][3])]
 
 			# Select new representatives for loci with multiple candidates
-			selected_candidates = mo.map_async_parallelizer(representative_inputs,
-															mo.function_helper,
-															config['CPU cores'],
-															show_progress=False)
+			# GPU mode: run sequentially (CUDA context can't fork)
+			if bw.is_gpu_enabled():
+				selected_candidates = []
+				for inp in representative_inputs:
+					result = mo.function_helper(inp)
+					selected_candidates.append(result)
+			else:
+				selected_candidates = mo.map_async_parallelizer(representative_inputs,
+																mo.function_helper,
+																config['CPU cores'],
+																show_progress=False)
 
 			for c in selected_candidates:
 				# Convert renamed ID back to original ID
@@ -2800,6 +2855,10 @@ def allele_calling(fasta_files, schema_directory, temp_directory,
 		iteration += 1
 
 	print('='*len(rep_iter_header))
+	print(f'  [TIMING] RepDet iteration breakdown: blast={_t_blast_elapsed:.1f}s, classify={_t_classify_elapsed:.1f}s, total_iter={_time.time()-_t_iter_start:.1f}s')
+
+	_t_repdet_elapsed = _time.time() - _t_repdet_start
+	print(f'  [TIMING] Representative determination: {_t_repdet_elapsed:.1f}s')
 
 	template_dict['classification_files'] = classification_files
 	template_dict['protein_fasta'] = distinct_prots
@@ -2814,6 +2873,7 @@ def main(input_file, loci_list, schema_directory, output_directory,
 		 no_inferred, output_unclassified, output_missing, output_novel,
 		 output_masked, no_cleanup, hash_profiles, ns, config):
 
+	import time as _time
 	start_time = pdt.get_datetime()
 
 	print(f' {ct.CONFIG_VALUES} ')
@@ -2891,6 +2951,7 @@ def main(input_file, loci_list, schema_directory, output_directory,
 							 loci_to_call, config, pre_computed_dir,
 							 loci_finder)
 
+	_t_wrap_start = _time.time()
 	# Assign allele identifiers, add alleles to schema and create output files
 	print(f'\n {ct.WRAPPING_UP} ')
 	print('='*(len(ct.WRAPPING_UP)+2))
@@ -2907,6 +2968,7 @@ def main(input_file, loci_list, schema_directory, output_directory,
 	# Sort to get output order similar to chewBBACA v2
 	results['classification_files'] = dict(sorted(results['classification_files'].items()))
 
+	_tw0 = _time.time()
 	print(f'Creating file with genome coordinates profiles ({ct.RESULTS_COORDINATES_BASENAME})...')
 	results_contigs = write_results_contigs(list(results['classification_files'].values()),
 											results['int_to_unique'],
@@ -2915,6 +2977,8 @@ def main(input_file, loci_list, schema_directory, output_directory,
 											classification_labels,
 											loci_finder)
 	outfile, repeated_info, repeated_counts = results_contigs
+	_tw1 = _time.time()
+	print(f'    [wrap] contigsInfo: {_tw1-_tw0:.1f}s')
 
 	# Identify paralogous loci
 	print('Identifying paralogous loci and creating files with the list of paralogous '
@@ -2940,6 +3004,8 @@ def main(input_file, loci_list, schema_directory, output_directory,
 	# Only keep data for loci that have novel alleles
 	novel_alleles = [r for r in novel_alleles if r is not None]
 	novel_alleles_count = sum([locus_novel[2] for locus_novel in novel_alleles])
+	_tw2 = _time.time()
+	print(f'    [wrap] assign IDs: {_tw2-_tw1:.1f}s')
 	print(f'Assigned identifiers to {novel_alleles_count} new alleles for {len(novel_alleles)} loci.')
 
 	updated_files = {}
@@ -3014,13 +3080,17 @@ def main(input_file, loci_list, schema_directory, output_directory,
 				total_hashes = update_hash_tables(updated_novel, loci_to_call,
 								   config['Translation table'], pre_computed_dir)
 
+	_tw3 = _time.time()
+	print(f'    [wrap] novel alleles+schema update: {_tw3-_tw2:.1f}s')
 	# Create file with allelic profiles
 	print(f'Creating file with the allelic profiles ({ct.RESULTS_ALLELES_BASENAME})...')
+	_tws = _time.time()
 	profiles_table = write_results_alleles(list(results['classification_files'].values()),
 										   list(results['int_to_unique'].values()),
 										   output_directory,
 										   classification_labels[-1],
 										   loci_finder)
+	print(f'      alleles: {_time.time()-_tws:.1f}s')
 
 	# Create file with masked profiles
 	if output_masked is True:
@@ -3029,6 +3099,7 @@ def main(input_file, loci_list, schema_directory, output_directory,
 
 	# Create file with class counts per input file
 	print(f'Creating file with class counts per input ({ct.RESULTS_STATISTICS_BASENAME})...')
+	_tws = _time.time()
 	input_stats_file = write_results_statistics(results['classification_files'],
 												results['int_to_unique'],
 												results['cds_counts'],
@@ -3036,14 +3107,17 @@ def main(input_file, loci_list, schema_directory, output_directory,
 												classification_labels,
 												repeated_counts,
 												results['invalid_alleles'])
+	print(f'      statistics: {_time.time()-_tws:.1f}s')
 
 	# Create file with class counts per locus called
 	print(f'Creating file with class counts per locus ({ct.LOCI_STATS_BASENAME})...')
+	_tws = _time.time()
 	loci_stats_file = write_loci_summary(results['classification_files'],
 										 output_directory,
 										 len(input_files),
 										 classification_labels,
 										 loci_finder)
+	print(f'      loci_summary: {_time.time()-_tws:.1f}s')
 
 	# Create FASTA file with unclassified CDSs
 	if output_unclassified is True:
@@ -3079,14 +3153,17 @@ def main(input_file, loci_list, schema_directory, output_directory,
 	# Create TSV file with hashed profiles
 	if hash_profiles is not None:
 		print(f'Creating file with {hash_profiles} hashed profiles...')
+		_tws = _time.time()
 		hashed_profiles_file = ph.main(profiles_table, schema_directory, output_directory,
 									   hash_profiles, config['CPU cores'], 100, updated_files,
 									   no_inferred)
+		print(f'      hashing: {_time.time()-_tws:.1f}s')
 
 	# Create TSV file with CDS coordinates
 	# Will not be created if input files contain set of CDS instead of contigs
 	if config['CDS input'] is False:
 		print(f'Creating file with the coordinates of CDSs identified in inputs ({ct.CDS_COORDINATES_BASENAME})...')
+		_tws = _time.time()
 		files = []
 		for gid, file in results['cds_coordinates'].items():
 			tsv_file = fo.join_paths(os.path.dirname(file), [f'{gid}_coordinates.tsv'])
@@ -3097,6 +3174,7 @@ def main(input_file, loci_list, schema_directory, output_directory,
 										[ct.CDS_COORDINATES_BASENAME])
 		fo.concatenate_files(files, cds_coordinates,
 							 header=ct.CDS_TABLE_HEADER)
+		print(f'      cds_coords: {_time.time()-_tws:.1f}s')
 
 	# Move file with list of excluded CDS
 	# File is not created if we only search for exact matches
@@ -3104,6 +3182,8 @@ def main(input_file, loci_list, schema_directory, output_directory,
 		print(f'Creating file with invalid CDSs ({ct.INVALID_CDS_BASENAME})...')
 		fo.move_file(results['invalid_alleles'][0], output_directory)
 
+	_tw4 = _time.time()
+	print(f'    [wrap] profiles+stats+hashing+coords: {_tw4-_tw3:.1f}s')
 	# Count total for each classification type
 	print('Counting number of classified CDSs...')
 	global_counts, total_cds = count_global_classifications(results['classification_files'].values(),
@@ -3146,4 +3226,6 @@ def main(input_file, loci_list, schema_directory, output_directory,
 								 config['BLAST Score Ratio'],
 								 output_directory)
 
+	_t_wrap_elapsed = _time.time() - _t_wrap_start
+	print(f'  [TIMING] Wrapping up: {_t_wrap_elapsed:.1f}s')
 	print(f'\nResults available in {output_directory}')

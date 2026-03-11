@@ -435,6 +435,14 @@ def run_allele_call():
 							 'argument values does not match the values in the '
 							 'config file.')
 
+	parser.add_argument('--gpu', required=False,
+						action='store_true', dest='use_gpu',
+						help='Use GPU-accelerated Smith-Waterman alignment '
+							 'instead of BLAST. Requires an NVIDIA GPU with '
+							 'CUDA support and CuPy installed. Produces the '
+							 'same allelic profiles as the standard BLAST-based '
+							 'pipeline.')
+
 	parser.add_argument('--mode', type=int, required=False,
 						choices=[1, 2, 3, 4], default=4,
 						help='Execution mode (1: only exact matches at DNA '
@@ -540,6 +548,14 @@ def run_allele_call():
 				'CDS input': args.cds_input,
 				'Prodigal mode': args.prodigal_mode,
 				'Mode': args.mode}
+
+	# Enable GPU acceleration if requested
+	if args.use_gpu:
+		try:
+			from utils import blast_wrapper as bw
+		except ModuleNotFoundError:
+			from CHEWBBACA.utils import blast_wrapper as bw
+		bw.enable_gpu()
 
 	allele_call.main(genome_list, loci_list, args.schema_directory,
 					 args.output_directory, args.no_inferred,

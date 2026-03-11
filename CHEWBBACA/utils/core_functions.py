@@ -719,7 +719,7 @@ def cluster_intra_filter(clusters, sequences, word_size,
 def blast_clusters(clusters, sequences, id_mapping, output_directory,
 				   blast_db, blastp_path, cpu_cores,
 				   blastdb_aliastool_path, only_rep=False):
-	"""Use BLAST to align sequences in the same clusters.
+	"""Use BLAST (or GPU Smith-Waterman) to align sequences in the same clusters.
 
 	Parameters
 	----------
@@ -754,6 +754,12 @@ def blast_clusters(clusters, sequences, id_mapping, output_directory,
 	blastp_results_dir = os.path.join(output_directory, 'BLASTp_outfiles')
 	fo.create_directory(blastp_results_dir)
 
+	# GPU mode: batch all alignments on GPU (no multiprocessing needed)
+	if bw.is_gpu_enabled():
+		blast_results = _gpu_blast_clusters(clusters, sequences, id_mapping,
+											blastp_results_dir, only_rep)
+		return [blast_results, blastp_results_dir]
+
 	# Create TXT files with the list of sequences per cluster
 	seqids_to_blast = sc.blast_seqids(clusters, blastp_results_dir, only_rep, id_mapping)
 
@@ -772,6 +778,109 @@ def blast_clusters(clusters, sequences, id_mapping, output_directory,
 											  show_progress=True)
 
 	return [blast_results, blastp_results_dir]
+
+
+def _gpu_blast_clusters(clusters, sequences_file, id_mapping,
+						output_directory, only_rep=False):
+	"""GPU implementation of blast_clusters.
+
+	Loads all sequences, builds alignment pairs for each cluster,
+	and runs them all on GPU in batched Smith-Waterman.
+	No multiprocessing needed - GPU handles parallelism.
+	"""
+	from Bio import SeqIO
+
+	# Load all sequences from the FASTA file
+	all_sequences = {}
+	for record in SeqIO.parse(sequences_file, 'fasta'):
+		all_sequences[record.id] = str(record.seq)
+
+	# Build inverse mapping for ID conversion
+	inv_id_mapping = {v: k for k, v in id_mapping.items()} if id_mapping else {}
+
+	# Collect all alignment pairs across all clusters
+	all_query_seqs = []
+	all_target_seqs = []
+	all_query_ids = []
+	all_target_ids = []
+	pair_cluster_map = []  # track which cluster each pair belongs to
+
+	for rep, members in clusters.items():
+		# Map representative to renamed ID
+		rep_renamed = id_mapping.get(rep, rep) if id_mapping else rep
+
+		# Member IDs (excluding representative)
+		member_ids = [id_mapping.get(m[0], m[0]) if id_mapping else m[0]
+					  for m in members]
+
+		if only_rep:
+			# Only align representative against cluster members (NOT self)
+			# This matches BLAST behavior: -seqidlist excludes representative
+			query_ids_cluster = [rep_renamed]
+			target_ids_cluster = member_ids
+		else:
+			# Align all against all within cluster (including representative)
+			query_ids_cluster = [rep_renamed] + member_ids
+			target_ids_cluster = [rep_renamed] + member_ids
+
+		for qid in query_ids_cluster:
+			if qid not in all_sequences:
+				continue
+			for tid in target_ids_cluster:
+				if tid not in all_sequences:
+					continue
+				all_query_seqs.append(all_sequences[qid])
+				all_target_seqs.append(all_sequences[tid])
+				all_query_ids.append(qid)
+				all_target_ids.append(tid)
+				pair_cluster_map.append(rep)
+
+	total_pairs = len(all_query_seqs)
+	print(f'\n  GPU: aligning {total_pairs} pairs across {len(clusters)} clusters...')
+
+	if total_pairs == 0:
+		return [[]]
+
+	# Get GPU aligner
+	aligner = bw._get_gpu_aligner()
+
+	# Run GPU alignment in batches
+	batch_size = 200000
+	all_results = []
+
+	for start in range(0, total_pairs, batch_size):
+		end = min(start + total_pairs, total_pairs)
+		batch_results = aligner.align_pairs(
+			all_query_seqs[start:end],
+			all_target_seqs[start:end],
+			all_query_ids[start:end],
+			all_target_ids[start:end]
+		)
+		all_results.extend(batch_results)
+		if total_pairs > batch_size:
+			print(f'\r  GPU: {min(end, total_pairs)}/{total_pairs} pairs aligned...', end='')
+
+	if total_pairs > batch_size:
+		print()
+
+	# Group results by cluster and write output files
+	cluster_results = {}
+	for i, r in enumerate(all_results):
+		cluster_rep = pair_cluster_map[i] if i < len(pair_cluster_map) else None
+		if cluster_rep:
+			cluster_results.setdefault(cluster_rep, []).append(r)
+
+	# Write one output file per cluster (same format as BLAST)
+	out_files = []
+	for rep, results in cluster_results.items():
+		blast_output = os.path.join(output_directory,
+									'{0}_blastout.tsv'.format(rep))
+		with open(blast_output, 'w') as f:
+			for r in results:
+				f.write('\t'.join(str(x) for x in r) + '\n')
+		out_files.append(blast_output)
+
+	return [out_files]
 
 
 def compute_bsr(subject_score, query_score):
@@ -825,6 +934,9 @@ def determine_self_scores(fasta_file, output_directory, makeblastdb_path,
 		tuples with the sequence length and the raw score
 		of the self-alignment as values.
 	"""
+	# GPU mode: compute self-scores on GPU (consistent with GPU cross-scores)
+	if bw.is_gpu_enabled():
+		return _gpu_determine_self_scores(fasta_file)
 	# Shorten sequence IDs to avoid issues with long identifiers when creating BLAST DBs
 	lcl_fasta = fo.join_paths(output_directory, [fo.file_basename(fasta_file, False)+'_LCL.fasta'])
 	# Return mapping between new short IDs and original IDs
@@ -967,6 +1079,55 @@ def determine_self_scores(fasta_file, output_directory, makeblastdb_path,
 
 	# Convert back to original IDs
 	self_scores = {id_mapping[k]: v for k, v in self_scores.items()}
+
+	return self_scores
+
+
+def _gpu_determine_self_scores(fasta_file):
+	"""GPU implementation of determine_self_scores.
+
+	Loads all sequences from the FASTA file and computes self-alignment
+	scores on GPU in a single batch. Much faster than individual BLAST calls.
+
+	Parameters
+	----------
+	fasta_file : str
+		Path to the FASTA file with protein sequences.
+
+	Returns
+	-------
+	self_scores : dict
+		{original_seq_id: (dna_length, raw_score)}
+	"""
+	from Bio import SeqIO
+
+	# Load sequences
+	sequences = {}
+	for record in SeqIO.parse(fasta_file, 'fasta'):
+		sequences[record.id] = str(record.seq)
+
+	seq_ids = list(sequences.keys())
+	seq_strs = [sequences[sid] for sid in seq_ids]
+
+	print(f'  GPU: computing self-scores for {len(seq_ids)} sequences...')
+
+	# Self-align all sequences on GPU
+	aligner = bw._get_gpu_aligner()
+	results = aligner.align_pairs(seq_strs, seq_strs, seq_ids, seq_ids)
+
+	self_scores = {}
+	for r in results:
+		seqid = r[0]
+		prot_len = int(r[3])
+		score = float(r[6])
+		# Convert protein length to DNA length (multiply by 3 + stop codon)
+		dna_length = (prot_len * 3) + 3
+		self_scores[seqid] = (dna_length, score)
+
+	# Check for missing sequences
+	missing = [sid for sid in seq_ids if sid not in self_scores]
+	if len(missing) > 0:
+		print(f'  Warning: could not compute self-scores for {len(missing)} sequences')
 
 	return self_scores
 
